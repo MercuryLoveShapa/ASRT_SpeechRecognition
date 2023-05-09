@@ -25,12 +25,11 @@
 
 import tensorflow as tf
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Dense, Dropout, Input, Reshape, BatchNormalization
-from tensorflow.keras.layers import Lambda, Activation, Conv2D, MaxPooling2D
+from tensorflow.keras.layers import Dense, Dropout, Input, Reshape, BatchNormalization, LSTM, GRU, Bidirectional
+from tensorflow.keras.layers import Lambda, Activation, Conv2D, MaxPooling2D, TimeDistributed
 from tensorflow.keras import backend as K
 import numpy as np
 from utils.ops import ctc_decode_delete_tail_blank
-
 
 class BaseModel:
     """
@@ -80,6 +79,92 @@ def ctc_lambda_func(args):
     y_pred, labels, input_length, label_length = args
     y_pred = y_pred[:, :, :]
     return K.ctc_batch_cost(labels, y_pred, input_length, label_length)
+
+class SpeechModelRNN(BaseModel):
+    """
+    定义RNN+CTC模型，使用函数式模型
+
+    输入层：200维的特征值序列，一条语音数据的最大长度设为1600（大约16s）\\
+    隐藏层：LSTM或GRU，可选择是否双向 \\
+    隐藏层：全连接层 \\
+    输出层：全连接层，神经元数量为self.MS_OUTPUT_SIZE，使用softmax作为激活函数， \\
+    CTC层：使用CTC的loss作为损失函数，实现连接性时序多输出
+
+    参数： \\
+        input_shape: tuple，默认值(1600, 200, 1) \\
+        output_size: int，默认值1428 \\
+        is_bidirectional: bool，默认值False，是否使用双向RNN
+        rnn_type: str，默认值'lstm'，可选值为'lstm'和'gru'
+        rnn_units: int，默认值128，RNN隐层神经元数量
+    """
+    def __init__(self, input_shape: tuple = (1600, 200, 1), output_size: int = 1428, is_bidirectional: bool = False, rnn_type: str = 'lstm', rnn_units: int = 128) -> None:
+        super().__init__()
+        self.input_shape = input_shape
+        self.output_shape = (input_shape[0], output_size)
+        self.is_bidirectional = is_bidirectional
+        self.rnn_type = rnn_type
+        self.rnn_units = rnn_units
+        if self.is_bidirectional:
+            self.rnn_units //= 2
+        self._model_name = f'SpeechModelRNN_{rnn_type}_{"bi_" if is_bidirectional else ""}{rnn_units}'
+        self.model, self.model_base = self._define_model(self.input_shape, self.output_shape[1])
+
+    def _define_model(self, input_shape, output_size) -> tuple:
+        label_max_string_length = 64
+
+        input_data = Input(name='the_input', shape=input_shape)
+        
+        layer_h1 = Reshape((self.input_shape[0], self.input_shape[1] * self.input_shape[2]))(input_data)
+        if self.is_bidirectional:
+            if self.rnn_type == 'lstm':
+                layer_h1 = Bidirectional(LSTM(units=self.rnn_units, return_sequences=True))(layer_h1)  # LSTM层
+            elif self.rnn_type == 'gru':
+                layer_h1 = Bidirectional(GRU(units=self.rnn_units, return_sequences=True))(layer_h1)  # GRU层
+        else:
+            if self.rnn_type == 'lstm':
+                layer_h1 = LSTM(units=self.rnn_units, return_sequences=True)(layer_h1)  # LSTM层
+            elif self.rnn_type == 'gru':
+                layer_h1 = GRU(units=self.rnn_units, return_sequences=True)(layer_h1)  # GRU层
+
+        layer_h2 = TimeDistributed(Dense(output_size, use_bias=True, kernel_initializer='he_normal'))(layer_h1)  # 全连接层
+        y_pred = Activation('softmax', name='Activation0')(layer_h2)
+
+        model_base = Model(inputs=input_data, outputs=y_pred)
+
+        labels = Input(name='the_labels', shape=[label_max_string_length], dtype='float32')
+        input_length = Input(name='input_length', shape=[1], dtype='int64')
+        label_length = Input(name='label_length', shape=[1], dtype='int64')
+        # Keras doesn't currently support loss funcs with extra parameters
+        # so CTC loss is implemented in a lambda layer
+        loss_out = Lambda(ctc_lambda_func, output_shape=(1,), name='ctc')([y_pred, labels, input_length, label_length])
+
+        model = Model(inputs=[input_data, labels, input_length, label_length], outputs=loss_out)
+
+        return model, model_base
+
+    def get_loss_function(self) -> dict:
+        return {'ctc': lambda y_true, y_pred: y_pred}
+
+    def forward(self, data_input):
+        batch_size = 1 
+        in_len = np.zeros((batch_size,), dtype=np.int32)
+        # 将输入数据放入一个batch中
+        in_len[0] = self.output_shape[0]
+        x_in = np.zeros((batch_size,) + self.input_shape)
+        x_in[0, :data_input.shape[0], :, 0] = data_input
+        # 使用模型的基础部分进行前向传播
+        base_pred = self.model_base.predict(x_in)
+        net_out_value = base_pred[:, :]
+        # 进行CTC解码并返回结果
+        out = ctc_decode_delete_tail_blank(net_out_value)
+        return out[0]
+
+    def save(self, path: str) -> None:
+        self.model.save(path)
+
+    def load(self, path: str) -> None:
+        self.model = tf.keras.models.load_model(path, compile=False)
+        self.model_base = Model(inputs=self.model.input[0], outputs=self.model.layers[-3].output)
 
 
 class SpeechModel251BN(BaseModel):
